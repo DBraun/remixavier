@@ -39,26 +39,34 @@ def align_over_window(a, b, max_offset, correlation_size, a_center=None, b_cente
         - a_vs_b : float
             Correlation of a against b
     '''
+    assert a.ndim == 2
+    C = a.shape[0]
     # Default values for the window centers
     if a_center is None:
-        a_center = a.shape[0]/2
+        a_center = a.shape[1] // 2
     if b_center is None:
-        b_center = b.shape[0]/2
+        b_center = b.shape[1] // 2
     # Avoid array out of bounds
-    if a_center - max_offset - correlation_size/2 < 0 or a_center + max_offset + correlation_size/2 > a.shape[0]:
-        raise ValueError, "The window in a around a_center of size max_offset + correlation_size goes out of bounds"
-    if b_center - correlation_size/2 < 0 or b_center + correlation_size/2 > b.shape[0]:
-        raise ValueError, "The window in b around b_center of size max_offset + correlation_size goes out of bounds"
+    if a_center - max_offset - correlation_size//2 < 0 or a_center + max_offset + correlation_size//2 > a.shape[1]:
+        raise ValueError("The window in a around a_center of size max_offset + correlation_size goes out of bounds")
+    if b_center - correlation_size//2 < 0 or b_center + correlation_size//2 > b.shape[1]:
+        raise ValueError("The window in b around b_center of size max_offset + correlation_size goes out of bounds")
     # Centered on a_center, extract 2*max_offset + correlation_size samples 
     # (so offsets between -max_offset and max_offset)
-    a_window = a[a_center - max_offset - correlation_size/2:a_center + max_offset + correlation_size/2]
+    a_window = a[:, a_center - max_offset - correlation_size//2:a_center + max_offset + correlation_size//2]
     # From b, the sample window will only be correlation_size samples
-    b_window = b[b_center - correlation_size/2:b_center + correlation_size/2]
-    a_vs_b = scipy.signal.fftconvolve(a_window, b_window[::-1], 'same')[correlation_size/2:-correlation_size/2]
-    # Compute offset of a relative to b
-    offset = np.argmax(a_vs_b) - max_offset + (a_center - b_center)
+    b_window = b[:, b_center - correlation_size//2:b_center + correlation_size//2]
+
+    offsets, correlations = [], []
+    for c in range(C):
+        a_vs_b = scipy.signal.fftconvolve(a_window[c], b_window[c][::-1], 'same')[correlation_size // 2 : -correlation_size // 2]
+        # Compute offset of a relative to b
+        offset = np.argmax(a_vs_b) - max_offset + (a_center - b_center)
+        offsets.append(offset)
+        correlations.append(a_vs_b)
+
     # Return offset and the max value of the correlation
-    return offset, a_vs_b
+    return np.array(offsets), np.array(correlations)
 
 # <codecell>
 
@@ -84,16 +92,18 @@ def get_best_fs_ratio(a, b, max_drift, steps, max_offset, correlation_size, cent
     Output:
         fs_ratio - fs ratio to make b line up well with a
     '''
+    assert a.ndim == 2 and b.ndim == 2
     # Sample rate ratios to try
     fs_ratios = center + np.linspace(-max_drift, max_drift, steps + 1)
     # The max correlation value for each fs ratio
     corr_max = np.zeros(fs_ratios.shape)
     for n, ratio in enumerate(fs_ratios):
         # Resample b with this fs ratio
-        b_resampled = librosa.resample(b, 1, ratio)
+        b_resampled = librosa.resample(b, orig_sr=1, target_sr=ratio)
         # Compute the max correlation
         _, corr = align_over_window(a, b_resampled, max_offset, correlation_size)
-        corr_max[n] = corr.max()
+        # take mean along channels and then max
+        corr_max[n] = corr.mean(axis=0).max()
     # Choose ratio with the highest correlation value
     return fs_ratios[np.argmax(corr_max)]
 
@@ -113,29 +123,33 @@ def apply_offsets_resample(b, offset_locations, offsets):
     :returns:
         - b_aligned : np.ndarray
             b with offsets applied
-    ''' 
-    assert offset_locations.shape[0] == offsets.shape[0]
+    '''
+    assert offsets.ndim == 2
+    assert offset_locations.shape[0] == offsets.shape[-1]
+    C, N = b.shape
     # Include signal boundaries in offset locations
-    offset_locations = np.append(0, np.append( offset_locations, b.shape[0]-100 ))
+    offset_locations = np.append(0, np.append(offset_locations, N - 100))
     # Allocate output signal
-    b_aligned = np.zeros(np.int(np.sum(np.diff(offset_locations)) + np.max(np.abs(offsets))))
+    b_aligned = np.zeros((C, int(np.sum(np.diff(offset_locations)) + int(np.max(np.abs(offsets))))))
     # Set last offset to whatever the second to last one was
-    offsets = np.append(offsets, offsets[-1])
-    current = 0
-    # !!!!!!!!!!!!!!!!!!
-    # Should zip here
-    # !!!!!!!!!!!!!!!!!!
-    for n, offset in enumerate(offsets):
-        start = offset_locations[n]
-        end = offset_locations[n + 1]
-        # Compute the necessary resampling ratio to compensate for this offset
-        ratio = 1 + (-offset + start - current)/(end - start)
-        # Resample this portion of the signal, with some padding at the end
-        resampled = librosa.resample(b[start:end + 100], 1, ratio)
-        # Compute length and place the signal
-        length = int(end - current - offset)
-        b_aligned[current:current + length] = resampled[:length]
-        current += length
+    offsets = np.append(offsets, offsets[:, -1][:, None], axis=1)
+    for c in range(C):
+        current = 0
+        # !!!!!!!!!!!!!!!!!!
+        # Should zip here
+        # !!!!!!!!!!!!!!!!!!
+        for n, offset in enumerate(offsets[c]):
+            start = offset_locations[n]
+            end = offset_locations[n + 1]
+            # Compute the necessary resampling ratio to compensate for this offset
+            ratio = 1 + (-offset + start - current)/(end - start)
+            # Resample this portion of the signal, with some padding at the end
+            resampled = librosa.resample(b[c, start:end + 100], orig_sr=1, target_sr=ratio)
+            # Compute length and place the signal
+            length = int(end - current - offset)
+            b_aligned[c, current:current + length] = resampled[:length]
+            current += length
+
     return b_aligned
 
 # <codecell>
@@ -164,7 +178,7 @@ def apply_offsets_cola(b, offset_locations, offsets):
     # Include signal boundaries in offset locations
     offset_locations = np.append(0, np.append(offset_locations, b.shape[0]))
     # Add in shifted windowed signal windows
-    for n in xrange(offsets.shape[0]):
+    for n in range(offsets.shape[0]):
         start = offset_locations[n]
         middle = offset_locations[n + 1]
         end = offset_locations[n + 2]
@@ -207,13 +221,16 @@ def get_local_offsets(a, b, hop, max_offset, correlation_size):
         local_offsets - Estimates the best local offset for the corresponding sample in offset_locations
     '''
     # Compute the locations where we'll estimate offsets
-    offset_locations = np.arange(correlation_size + max_offset, a.shape[0] - (correlation_size + max_offset), hop)
-    local_offsets = np.zeros(offset_locations.shape[0])
-    correlations = np.zeros((offset_locations.shape[0], 2*max_offset ))
+    assert a.ndim == 2
+    C, N = a.shape
+    offset_locations = np.arange(correlation_size + max_offset, N - (correlation_size + max_offset), hop)
+    local_offsets = np.zeros((C, offset_locations.shape[0]))
+    correlations = np.zeros((C, offset_locations.shape[0], 2*max_offset ))
     for n, offset_location in enumerate(offset_locations):
         # Compute correlation
-        local_offsets[n], correlations[n] = align_over_window(b, a, max_offset, correlation_size,
-                                                              offset_location, offset_location)
+        local_offsets[:, n], correlations[:, n] = align_over_window(b, a, max_offset, correlation_size,
+                                                                    offset_location, offset_location)
+
     return offset_locations, local_offsets, correlations
 
 # <codecell>
@@ -264,13 +281,15 @@ def remove_outliers(x, median_size=13):
         - x_cleaned : np.ndarray
             Cleaned version of x
     '''
+    assert x.ndim == 2
+    C, N = x.shape
     median_filtered = scipy.signal.medfilt(x, median_size)
-    global_std = np.std(x)
+    global_std = np.std(x, axis=-1)
     x_cleaned = x.copy()
-    for n in xrange(x.shape[0]):
-        if n == 0: continue
-        if x_cleaned[n] < median_filtered[n] - global_std or x_cleaned[n] > median_filtered[n] + global_std:
-            x_cleaned[n] = x_cleaned[n - 1]
+    for c in range(C):
+        for n in range(1, N):
+            if x_cleaned[c, n] < median_filtered[c, n] - global_std[c] or x_cleaned[c, n] > median_filtered[c, n] + global_std[c]:
+                x_cleaned[c, n] = x_cleaned[c, n - 1]
     return x_cleaned
 
 # <codecell>
@@ -288,12 +307,12 @@ def wiener_enhance(target, accomp, thresh=-6, transit=3, n_fft=2048):
     Output:
         filtered - Target, Wiener filtered to try to remove noise
     '''
-    target_spec = librosa.stft(target, n_fft=n_fft, hop_length=n_fft/4)
-    accomp_spec = librosa.stft(accomp, n_fft=n_fft, hop_length=n_fft/4)
-    spec_ratio = librosa.logamplitude(target_spec) - librosa.logamplitude(accomp_spec)
+    target_spec = librosa.stft(target, n_fft=n_fft, hop_length=n_fft//4)
+    accomp_spec = librosa.stft(accomp, n_fft=n_fft, hop_length=n_fft//4)
+    spec_ratio = librosa.amplitude_to_db(np.abs(target_spec)) - librosa.amplitude_to_db(np.abs(accomp_spec))
     spec_ratio = (spec_ratio - thresh)/transit
     mask = 0.5 + 0.5*(spec_ratio/np.sqrt(1 + spec_ratio**2))
-    return librosa.istft(target_spec*mask, hop_length=n_fft/4)
+    return librosa.istft(target_spec*mask, hop_length=n_fft//4)
 
 # <codecell>
 
@@ -302,20 +321,24 @@ def pad(a, b):
     Given two vectors, pad the shorter one with zeros (at the end) so that they are the same size
     
     Input:
-        a - vector
-        b - vector
+        a - vector shaped (C, Na)
+        b - vector shaped (C, Nb)
     Output:
         a - vector, padded if needed
         b - vector, padded if needed
     '''
-    if a.shape[0] > b.shape[0]:
-        c = np.zeros(a.shape[0])
-        c[:b.shape[0]] = b
-        return a, c
-    if a.shape[0] < b.shape[0]:
-        c = np.zeros(b.shape[0])
-        c[:a.shape[0]] = a
-        return c, b
+
+    C, Na = a.shape
+    _, Nb = b.shape
+
+    if Na > Nb:
+        b_padded = np.zeros((C, Na))
+        b_padded[:, :Nb] = b
+        return a, b_padded
+    elif Na < Nb:
+        a_padded = np.zeros((C, Nb))
+        a_padded[:, :Na] = a
+        return a_padded, b
     return a, b
 
 # <codecell>
@@ -353,21 +376,23 @@ def align(a, b, fs, correlation_size=4., max_global_offset=2.,
     '''
     # Make them the same length
     a, b = pad(a, b)
+    C, N = a.shape
     # Fix any global offset
     if max_global_offset > 0:
-        offset, _ = align_over_window(a, b, max_offset=int(max_global_offset*fs),
-                                      correlation_size=int(correlation_size*fs))
-        if offset < 0:
-            a = np.append(np.zeros(-offset), a)
-        elif offset > 0:
-            b = np.append(np.zeros(offset), b)
+        offsets, _ = align_over_window(a, b, max_offset=int(max_global_offset*fs),
+                                       correlation_size=int(correlation_size*fs))
+        for c in range(C):
+            if offsets[c] < 0:
+                a[c] = np.append(np.zeros(-offsets[c]), a[c])
+            elif offsets[c] > 0:
+                b[c] = np.append(np.zeros(offsets[c]), b[c])
     # Fix skew
     if max_skew > 0:     
         # Downsample to 2kHz for speed!  Doesn't make a big difference performance-wise
         if fs > 2000:
             fs_ds = 2000
-            a_ds = librosa.resample(a, fs, fs_ds)
-            b_ds =  librosa.resample(b, fs, fs_ds)
+            a_ds = librosa.resample(a, orig_sr=fs, target_sr=fs_ds)
+            b_ds =  librosa.resample(b, orig_sr=fs, target_sr=fs_ds)
         else:
             a_ds = a.copy()
             b_ds = b.copy()
@@ -381,7 +406,7 @@ def align(a, b, fs, correlation_size=4., max_global_offset=2.,
         # Get fine estimate
         fs_ratio = get_best_fs_ratio(a_ds, b_ds, .0001, 200, int(max_skew_offset*fs_ds),
                                      int(correlation_size*fs_ds), fs_ratio)
-        b = librosa.resample(b, 1, fs_ratio)
+        b = librosa.resample(b, orig_sr=1, target_sr=fs_ratio)
 
     # Estimate offset locations every "hop" seconds
     offset_locations, offsets, correlations = get_local_offsets(a, b, int(fs*hop), int(fs*max_local_offset),
@@ -419,14 +444,20 @@ def reverse_channel(a, b, n_fft=2**13, win_length=2**12, hop_length=2**10):
         - b_filtered : np.ndarray
             The signal b, filtered to reduce channel distortion
     '''
+    assert a.ndim == 2
+    C = a.shape[0]
     # Compute spectrograms
     a_spec = librosa.stft(a, n_fft=n_fft, win_length=win_length, hop_length=hop_length)
     b_spec = librosa.stft(b, n_fft=n_fft, win_length=win_length, hop_length=hop_length)
-    # Compute the best filter
-    H = best_filter_coefficients(a_spec, b_spec)
-    # Apply it in the frequency domain (ignoring aliasing!  Yikes)
-    b_spec_filtered = H*b_spec
+
+    assert a_spec.shape[0] == C
+
+    b_spec_filtered = b_spec
+    for c in range(C):
+        # Compute the best filter
+        H = best_filter_coefficients(a_spec[c], b_spec[c])
+        # Apply it in the frequency domain (ignoring aliasing!  Yikes)
+        b_spec_filtered[c] *= H
     # Get back to time domain
     b_filtered = librosa.istft(b_spec_filtered, win_length=win_length, hop_length=hop_length)
     return b_filtered
-

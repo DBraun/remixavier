@@ -1,0 +1,4 @@
+librosa>=0.6
+PyQt5
+soundfile>=0.12
+mir_eval
