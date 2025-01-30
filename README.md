@@ -24,7 +24,7 @@ The python script ``experiments.py`` contains all of the code required to genera
 * [Scipy/Numpy](http://www.scipy.org/)
 * [librosa](https://github.com/bmcfee/librosa)
 * [mir_eval](https://github.com/craffel/mir_eval)
-* [PyQt4](http://www.riverbankcomputing.co.uk/software/pyqt/download) (only required by ``remixavier.py``)
+* [PyQt5](https://pypi.org/project/PyQt5) (only required by ``remixavier.py``)
 * [matplotlib](http://matplotlib.org/) (only required by ``experiments.py``)
 
 ## MATLAB code
